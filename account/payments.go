@@ -39,6 +39,8 @@ const (
 	defaultInvoiceExpiry       int64 = 3600
 	invoiceCustomPartDelimiter       = " |\n"
 	transferFundsRequest             = "Bitcoin Transfer"
+	waitHtlcsSettledInterval         = time.Millisecond * 20
+	waitHtlcsSettledTimeout          = time.Second * 5
 )
 
 // PaymentResponse is the response of a payment attempt.
@@ -945,8 +947,14 @@ func (a *Service) watchPayments() {
 				a.log.Criticalf("Failed to receive an invoice : %v", err)
 				return
 			}
-			if invoice.Settled {
-				// TODO: Wait for pending htlcs here.
+			if invoice.State == lnrpc.Invoice_SETTLED {
+				err := a.waitHtlcsSettled(ctx, invoice)
+				if err != nil {
+					// NOTE: On error, we'll notify invoice settled anyway.
+					// Not returning here.
+					a.log.Errorf("Failed wait for htlc settlement: %v", err)
+				}
+
 				a.log.Infof("watchPayments adding a received payment")
 				if err = a.onNewReceivedPayment(invoice); err != nil {
 					a.log.Criticalf("Failed to update received payment : %v", err)
@@ -961,6 +969,60 @@ func (a *Service) watchPayments() {
 		a.log.Infof("Canceling subscription")
 		cancel()
 	}()
+}
+
+func (a *Service) waitHtlcsSettled(ctx context.Context, invoice *lnrpc.Invoice) error {
+	lnclient := a.daemonAPI.APIClient()
+	routerclient := a.daemonAPI.RouterClient()
+
+	subctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	htlcclient, err := routerclient.SubscribeHtlcEvents(
+		subctx,
+		&routerrpc.SubscribeHtlcEventsRequest{},
+	)
+	if err != nil {
+		return err
+	}
+
+	// Get the subscribed event so htlc lookups are reliable.
+	_, err = htlcclient.Recv()
+	if err != nil {
+		return err
+	}
+
+	a.log.Debugf("Invoice %x: lookup state for %v htlcs", invoice.RHash, len(invoice.Htlcs))
+	timeout := time.Now().Add(waitHtlcsSettledTimeout)
+	for _, h := range invoice.Htlcs {
+		for {
+			htlc, err := lnclient.LookupHtlc(ctx, &lnrpc.LookupHtlcRequest{
+				ChanId:    h.ChanId,
+				HtlcIndex: h.HtlcIndex,
+			})
+			if err != nil {
+				if !strings.Contains(err.Error(), "htlc unknown") {
+					return fmt.Errorf("failed to lookup htlc: %w", err)
+				}
+			}
+
+			if htlc != nil && htlc.Settled {
+				break
+			}
+
+			select {
+			case <-time.After(waitHtlcsSettledInterval):
+			case <-time.After(time.Until(timeout)):
+				return fmt.Errorf("timed out waiting for htlcs to finalize")
+			case <-ctx.Done():
+				a.log.Warnf("Invoice %x: some htlcs were not finalized before context was done.", invoice.RHash)
+				return ctx.Err()
+			}
+		}
+	}
+
+	a.log.Debugf("Invoice %x: All htlcs settled.", invoice.RHash)
+	return nil
 }
 
 func (a *Service) syncSentPayments() error {
